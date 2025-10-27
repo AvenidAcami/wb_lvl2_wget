@@ -98,24 +98,12 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 
 	ct := resp.Header.Get("Content-Type")
 	mediatype, _, _ := mime.ParseMediaType(ct)
-	relPath := urlutil.CleanPathForFile(u)
+	isHTML := mediatype == "text/html"
 
-	if mediatype == "text/html" || strings.HasSuffix(u.Path, "/") {
+	relPath := urlutil.CleanPathForFile(u, isHTML)
+
+	if isHTML {
 		htmlStr := string(rawHTML)
-
-		replacements := []struct {
-			old string
-			new string
-		}{
-			{`src="/`, `src="./`},
-			{`href="/`, `href="./`},
-			{`action="/`, `action="./`},
-			{`url("/`, `url("./`},
-		}
-		for _, r := range replacements {
-			htmlStr = strings.ReplaceAll(htmlStr, r.old, r.new)
-		}
-
 		if !strings.Contains(htmlStr, "<base") && strings.Contains(htmlStr, "<head>") {
 			htmlStr = strings.Replace(htmlStr, "<head>", "<head>\n<base href=\"./\">", 1)
 		}
@@ -155,9 +143,10 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 }
 
 func (d *Downloader) rewriteAll() error {
-	hrefRe := regexp.MustCompile(`(?i)(href|src)=["'](/[^"']+)["']`)
+	hrefRe := regexp.MustCompile(`(?i)(href|src)=["']([^"']+)["']`)
 
 	for uStr, local := range d.urlToLocal {
+		// переписываем только HTML-файлы
 		if !(strings.HasSuffix(local, ".html") || strings.HasSuffix(local, "index.html")) {
 			continue
 		}
@@ -169,29 +158,24 @@ func (d *Downloader) rewriteAll() error {
 		}
 
 		s := string(b)
-		baseURL, _ := url.Parse(uStr)
 
-		for srcURL, localPath := range d.urlToLocal {
-			targetURL, _ := url.Parse(srcURL)
-			if !urlutil.SameDomain(baseURL, targetURL) {
-				continue
-			}
-
-			rel := relativeFilePath(local, localPath)
-			s = strings.ReplaceAll(s, srcURL, rel)
-		}
-
+		// заменяем абсолютные и относительные ссылки на локальные пути
 		s = hrefRe.ReplaceAllStringFunc(s, func(match string) string {
 			m := hrefRe.FindStringSubmatch(match)
 			if len(m) < 3 {
 				return match
 			}
-			attr, absPath := m[1], m[2]
+			attr, urlPart := m[1], m[2]
 
-			fakeBase, _ := url.Parse(uStr)
-			target, _ := url.Parse(absPath)
-			fullURL := fakeBase.ResolveReference(target).String()
+			// строим полную URL относительно текущего HTML-файла
+			baseURL, _ := url.Parse(uStr)
+			targetURL, err := url.Parse(urlPart)
+			if err != nil {
+				return match
+			}
+			fullURL := baseURL.ResolveReference(targetURL).String()
 
+			// если такой URL есть в скачанных файлах, заменяем на относительный путь
 			localPath, ok := d.urlToLocal[fullURL]
 			if !ok {
 				return match

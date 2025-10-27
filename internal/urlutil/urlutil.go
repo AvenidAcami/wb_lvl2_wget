@@ -18,16 +18,16 @@ func ResolveURL(base *url.URL, href string) (*url.URL, error) {
 	return base.ResolveReference(u), nil
 }
 
-func CleanPathForFile(u *url.URL) string {
+func CleanPathForFile(u *url.URL, isHTML bool) string {
 	host := u.Hostname()
 	p := u.EscapedPath()
 
-	if p == "" || strings.HasSuffix(p, "/") {
-		p = path.Join(p, "index.html")
-	}
-
-	if !strings.Contains(path.Base(p), ".") {
-		p = path.Join(p, "index.html")
+	if isHTML {
+		if p == "" || strings.HasSuffix(p, "/") {
+			p = path.Join(p, "index.html")
+		} else if !strings.Contains(path.Base(p), ".") {
+			p = path.Join(p, "index.html")
+		}
 	}
 
 	out := path.Join(host, p)

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
 	"wb_lvl2_wget/internal/urlutil"
 
 	"golang.org/x/net/html"
@@ -17,15 +18,24 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 	}
 
 	addURL := func(slice *[]string, raw string) {
+		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			return
 		}
-		if strings.HasPrefix(raw, "data:") || strings.HasPrefix(raw, "javascript:") {
+		if strings.HasPrefix(raw, "data:") || strings.HasPrefix(raw, "javascript:") || strings.HasPrefix(raw, "#") {
 			return
 		}
-		if u, err := urlutil.ResolveURL(base, raw); err == nil {
-			*slice = append(*slice, u.String())
+
+		u, err := urlutil.ResolveURL(base, raw)
+		if err != nil {
+			return
 		}
+
+		if u.Host != "" && u.Host != base.Host {
+			return
+		}
+
+		*slice = append(*slice, u.String())
 	}
 
 	var visit func(*html.Node)
@@ -38,12 +48,14 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 						addURL(&links, a.Val)
 					}
 				}
-			case "img", "script", "iframe", "source", "audio", "video":
+
+			case "img", "iframe", "source", "audio", "video", "script":
 				for _, a := range n.Attr {
 					if a.Key == "src" {
 						addURL(&resources, a.Val)
 					}
 				}
+
 			case "link":
 				var href, rel string
 				for _, a := range n.Attr {
@@ -61,14 +73,7 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 					strings.Contains(href, ".svg")) {
 					addURL(&resources, href)
 				}
-			case "meta":
-				for _, a := range n.Attr {
-					if a.Key == "content" && (strings.Contains(a.Val, ".png") ||
-						strings.Contains(a.Val, ".json") ||
-						strings.Contains(a.Val, ".svg")) {
-						addURL(&resources, a.Val)
-					}
-				}
+
 			case "object", "embed":
 				for _, a := range n.Attr {
 					if a.Key == "data" {
@@ -76,6 +81,7 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 					}
 				}
 			}
+
 			for _, a := range n.Attr {
 				if strings.HasPrefix(a.Key, "data-") && (strings.Contains(a.Val, "/") || strings.Contains(a.Val, ".")) {
 					addURL(&resources, a.Val)
@@ -85,15 +91,15 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 				}
 			}
 		}
+
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			visit(c)
 		}
 	}
-
 	visit(doc)
 
-	svgRe := regexp.MustCompile(`url\(["']?([^"')]+\.svg)["']?\)`)
-	matches := svgRe.FindAllSubmatch(body, -1)
+	cssRe := regexp.MustCompile(`url\(["']?([^"')]+)["']?\)`)
+	matches := cssRe.FindAllSubmatch(body, -1)
 	for _, m := range matches {
 		if len(m) > 1 {
 			addURL(&resources, string(m[1]))
