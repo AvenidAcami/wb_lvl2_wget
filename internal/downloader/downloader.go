@@ -63,20 +63,25 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 	if depth > d.cfg.MaxDepth {
 		return nil
 	}
-	if _, ok := d.visited[u.String()]; ok {
+
+	uStr := u.String()
+	if _, ok := d.visited[uStr]; ok {
 		return nil
 	}
-	d.visited[u.String()] = struct{}{}
+	d.visited[uStr] = struct{}{}
 
-	log.Printf("[%d] downloading %s", depth, u.String())
-	resp, err := d.client.Get(u.String())
+	log.Printf("[%d] downloading %s", depth, uStr)
+
+	resp, err := d.client.Get(uStr)
 	if err != nil {
+		log.Printf("[%d] ERROR: request failed for %s: %v", depth, uStr, err)
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("bad status %d for %s", resp.StatusCode, u.String())
+		log.Printf("[%d] ERROR: bad status %d for %s", depth, resp.StatusCode, uStr)
+		return fmt.Errorf("bad status %d for %s", resp.StatusCode, uStr)
 	}
 
 	var reader io.Reader = resp.Body
@@ -86,7 +91,7 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 			defer gz.Close()
 			reader = gz
 		} else {
-			log.Printf("warning: gzip decode failed for %s: %v", u.String(), err)
+			log.Printf("[%d] warning: gzip decode failed for %s: %v", depth, uStr, err)
 		}
 	}
 
@@ -94,49 +99,74 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 	if _, err := io.Copy(&buf, reader); err != nil {
 		return err
 	}
-	rawHTML := buf.Bytes()
+	raw := buf.Bytes()
 
 	ct := resp.Header.Get("Content-Type")
 	mediatype, _, _ := mime.ParseMediaType(ct)
 	isHTML := mediatype == "text/html"
 
 	relPath := urlutil.CleanPathForFile(u, isHTML)
+	d.urlToLocal[uStr] = relPath
 
 	if isHTML {
-		htmlStr := string(rawHTML)
+		htmlStr := string(raw)
 		if !strings.Contains(htmlStr, "<base") && strings.Contains(htmlStr, "<head>") {
 			htmlStr = strings.Replace(htmlStr, "<head>", "<head>\n<base href=\"./\">", 1)
+		}
+
+		links, resources, _, err := parser.ExtractLinksAndResources(u, []byte(htmlStr))
+		if err != nil {
+			log.Printf("[%d] parse error on %s: %v", depth, uStr, err)
+			return err
 		}
 
 		if _, err := storage.SaveFile(d.cfg.OutDir, relPath, strings.NewReader(htmlStr)); err != nil {
 			return err
 		}
 
-		links, resources, _, err := parser.ExtractLinksAndResources(u, []byte(htmlStr))
-		if err != nil {
-			return err
-		}
-
-		d.urlToLocal[u.String()] = relPath
+		log.Printf("[%d] → found %d links, %d resources in %s", depth, len(links), len(resources), uStr)
 
 		for _, r := range resources {
 			ru, err := url.Parse(r)
-			if err == nil && urlutil.SameDomain(root, ru) {
-				_ = d.downloadRecursive(ru, root, depth+1)
+			if err != nil {
+				continue
+			}
+			if !urlutil.SameDomain(root, ru) {
+				continue
+			}
+			if _, ok := d.visited[ru.String()]; ok {
+				continue
+			}
+
+			log.Printf("[%d] downloading resource %s", depth, ru)
+			if err := d.downloadRecursive(ru, root, depth+1); err != nil {
+				log.Printf("[%d] resource fetch failed for %s: %v", depth, ru, err)
 			}
 		}
 
 		for _, l := range links {
 			lu, err := url.Parse(l)
-			if err == nil && urlutil.SameDomain(root, lu) {
-				_ = d.downloadRecursive(lu, root, depth+1)
+			if err != nil {
+				continue
+			}
+			if !urlutil.SameDomain(root, lu) {
+				continue
+			}
+			if _, ok := d.visited[lu.String()]; ok {
+				continue
+			}
+
+			log.Printf("[%d] following link %s", depth, lu)
+			if err := d.downloadRecursive(lu, root, depth+1); err != nil {
+				log.Printf("[%d] link fetch failed for %s: %v", depth, lu, err)
 			}
 		}
+
 	} else {
-		if _, err := storage.SaveFile(d.cfg.OutDir, relPath, bytes.NewReader(rawHTML)); err != nil {
+		if _, err := storage.SaveFile(d.cfg.OutDir, relPath, bytes.NewReader(raw)); err != nil {
 			return err
 		}
-		d.urlToLocal[u.String()] = relPath
+		log.Printf("[%d] saved file %s (%s)", depth, uStr, relPath)
 	}
 
 	return nil
@@ -146,7 +176,6 @@ func (d *Downloader) rewriteAll() error {
 	hrefRe := regexp.MustCompile(`(?i)(href|src)=["']([^"']+)["']`)
 
 	for uStr, local := range d.urlToLocal {
-		// переписываем только HTML-файлы
 		if !(strings.HasSuffix(local, ".html") || strings.HasSuffix(local, "index.html")) {
 			continue
 		}
@@ -159,7 +188,6 @@ func (d *Downloader) rewriteAll() error {
 
 		s := string(b)
 
-		// заменяем абсолютные и относительные ссылки на локальные пути
 		s = hrefRe.ReplaceAllStringFunc(s, func(match string) string {
 			m := hrefRe.FindStringSubmatch(match)
 			if len(m) < 3 {
@@ -167,7 +195,6 @@ func (d *Downloader) rewriteAll() error {
 			}
 			attr, urlPart := m[1], m[2]
 
-			// строим полную URL относительно текущего HTML-файла
 			baseURL, _ := url.Parse(uStr)
 			targetURL, err := url.Parse(urlPart)
 			if err != nil {
@@ -175,7 +202,6 @@ func (d *Downloader) rewriteAll() error {
 			}
 			fullURL := baseURL.ResolveReference(targetURL).String()
 
-			// если такой URL есть в скачанных файлах, заменяем на относительный путь
 			localPath, ok := d.urlToLocal[fullURL]
 			if !ok {
 				return match
