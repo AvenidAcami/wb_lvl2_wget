@@ -103,70 +103,214 @@ func (d *Downloader) downloadRecursive(u, root *url.URL, depth int) error {
 
 	ct := resp.Header.Get("Content-Type")
 	mediatype, _, _ := mime.ParseMediaType(ct)
-	isHTML := mediatype == "text/html"
+	isHTML := strings.Contains(mediatype, "text/html")
 
 	relPath := urlutil.CleanPathForFile(u, isHTML)
 	d.urlToLocal[uStr] = relPath
 
-	if isHTML {
-		htmlStr := string(raw)
-		if !strings.Contains(htmlStr, "<base") && strings.Contains(htmlStr, "<head>") {
-			htmlStr = strings.Replace(htmlStr, "<head>", "<head>\n<base href=\"./\">", 1)
+	if _, err := storage.SaveFile(d.cfg.OutDir, relPath, bytes.NewReader(raw)); err != nil {
+		log.Printf("[%d] save error for %s: %v", depth, relPath, err)
+		return err
+	}
+
+	if !isHTML {
+		if strings.HasSuffix(strings.ToLower(u.Path), ".css") {
+			cssURLPattern := regexp.MustCompile(`url\((?:'([^']+)'|"([^"]+)"|([^)"']+))\)`)
+			matches := cssURLPattern.FindAllSubmatch(raw, -1)
+
+			for _, m := range matches {
+				var cssRes string
+				for i := 1; i <= 3; i++ {
+					if len(m) > i && len(m[i]) > 0 {
+						cssRes = string(m[i])
+						break
+					}
+				}
+				if cssRes == "" {
+					continue
+				}
+
+				if strings.HasPrefix(cssRes, "data:") ||
+					strings.HasPrefix(cssRes, "http://") ||
+					strings.HasPrefix(cssRes, "https://") {
+					continue
+				}
+
+				fullRes, err := urlutil.ResolveURL(u, cssRes)
+				if err != nil {
+					continue
+				}
+				if !urlutil.SameDomain(root, fullRes) {
+					continue
+				}
+				if _, ok := d.visited[fullRes.String()]; ok {
+					continue
+				}
+
+				log.Printf("[%d] downloading CSS resource %s", depth, fullRes)
+				if err := d.downloadRecursive(fullRes, root, depth+1); err != nil {
+					log.Printf("[%d] css resource fetch failed for %s: %v", depth, fullRes, err)
+				}
+			}
 		}
 
-		links, resources, _, err := parser.ExtractLinksAndResources(u, []byte(htmlStr))
-		if err != nil {
-			log.Printf("[%d] parse error on %s: %v", depth, uStr, err)
-			return err
-		}
+		log.Printf("[%d] saved non-HTML resource %s → %s", depth, uStr, relPath)
+		return nil
+	}
 
+	htmlStr := string(raw)
+	if !strings.Contains(htmlStr, "<base") && strings.Contains(htmlStr, "<head>") {
+		htmlStr = strings.Replace(htmlStr, "<head>", "<head>\n<base href=\"./\">", 1)
 		if _, err := storage.SaveFile(d.cfg.OutDir, relPath, strings.NewReader(htmlStr)); err != nil {
-			return err
+			log.Printf("[%d] warning: failed rewrite base for %s: %v", depth, relPath, err)
+		}
+	}
+
+	links, resources, _, err := parser.ExtractLinksAndResources(u, []byte(htmlStr))
+	if err != nil {
+		log.Printf("[%d] parse error on %s: %v", depth, uStr, err)
+		return err
+	}
+
+	cssInlinePattern := regexp.MustCompile(`url\((?:'([^']+)'|"([^"]+)"|([^)"']+))\)`)
+	if matches := cssInlinePattern.FindAllStringSubmatch(htmlStr, -1); matches != nil {
+		for _, mm := range matches {
+			var cssRes string
+			for i := 1; i <= 3; i++ {
+				if len(mm) > i && mm[i] != "" {
+					cssRes = mm[i]
+					break
+				}
+			}
+			if cssRes == "" {
+				continue
+			}
+			if strings.HasPrefix(cssRes, "data:") ||
+				strings.HasPrefix(cssRes, "http://") ||
+				strings.HasPrefix(cssRes, "https://") {
+				continue
+			}
+			if full, err := urlutil.ResolveURL(u, cssRes); err == nil {
+				resources = append(resources, full.String())
+			}
+		}
+	}
+
+	log.Printf("[%d] found %d links, %d resources in %s", depth, len(links), len(resources), uStr)
+
+	for _, r := range resources {
+		ru, err := url.Parse(r)
+		if err != nil {
+			continue
 		}
 
-		log.Printf("[%d] → found %d links, %d resources in %s", depth, len(links), len(resources), uStr)
+		if !urlutil.SameDomain(root, ru) {
+			log.Printf("[%d] skip external resource %s", depth, ru)
+			continue
+		}
 
-		for _, r := range resources {
-			ru, err := url.Parse(r)
+		if _, ok := d.visited[ru.String()]; ok {
+			continue
+		}
+
+		log.Printf("[%d] downloading resource %s", depth, ru)
+		if err := d.downloadRecursive(ru, root, depth+1); err != nil {
+			log.Printf("[%d] resource fetch failed for %s: %v", depth, ru, err)
+		}
+	}
+
+	for _, l := range links {
+		lu, err := url.Parse(l)
+		if err != nil {
+			continue
+		}
+		if !urlutil.SameDomain(root, lu) {
+			log.Printf("[%d] skip external link %s", depth, lu)
+			continue
+		}
+		if _, ok := d.visited[lu.String()]; ok {
+			continue
+		}
+
+		log.Printf("[%d] following link %s", depth, lu)
+		if err := d.downloadRecursive(lu, root, depth+1); err != nil {
+			log.Printf("[%d] link fetch failed for %s: %v", depth, lu, err)
+		}
+	}
+
+	cssURLPattern := regexp.MustCompile(`url\((?:'([^']+)'|"([^"]+)"|([^)"']+))\)`)
+	for _, r := range resources {
+		if !strings.HasSuffix(strings.ToLower(r), ".css") {
+			continue
+		}
+
+		cssURL, err := url.Parse(r)
+		if err != nil {
+			continue
+		}
+
+		localPath, ok := d.urlToLocal[cssURL.String()]
+		if !ok {
+			noq := *cssURL
+			noq.RawQuery = ""
+			if lp, ok2 := d.urlToLocal[noq.String()]; ok2 {
+				localPath = lp
+				ok = true
+			}
+		}
+		if !ok {
+			for k, v := range d.urlToLocal {
+				if ku, err := url.Parse(k); err == nil && ku.Path == cssURL.Path {
+					localPath = v
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
+
+		fullLocal := path.Join(d.cfg.OutDir, localPath)
+		b, err := os.ReadFile(fullLocal)
+		if err != nil {
+			continue
+		}
+
+		matches := cssURLPattern.FindAllSubmatch(b, -1)
+		for _, m := range matches {
+			var cssRes string
+			for i := 1; i <= 3; i++ {
+				if len(m) > i && len(m[i]) > 0 {
+					cssRes = string(m[i])
+					break
+				}
+			}
+			if cssRes == "" {
+				continue
+			}
+			if strings.HasPrefix(cssRes, "data:") ||
+				strings.HasPrefix(cssRes, "http://") ||
+				strings.HasPrefix(cssRes, "https://") {
+				continue
+			}
+
+			fullRes, err := urlutil.ResolveURL(cssURL, cssRes)
 			if err != nil {
 				continue
 			}
-			if !urlutil.SameDomain(root, ru) {
+			if !urlutil.SameDomain(root, fullRes) {
 				continue
 			}
-			if _, ok := d.visited[ru.String()]; ok {
+			if _, ok := d.visited[fullRes.String()]; ok {
 				continue
 			}
 
-			log.Printf("[%d] downloading resource %s", depth, ru)
-			if err := d.downloadRecursive(ru, root, depth+1); err != nil {
-				log.Printf("[%d] resource fetch failed for %s: %v", depth, ru, err)
+			log.Printf("[%d] downloading CSS-local resource %s", depth, fullRes)
+			if err := d.downloadRecursive(fullRes, root, depth+1); err != nil {
+				log.Printf("[%d] css-local resource fetch failed for %s: %v", depth, fullRes, err)
 			}
 		}
-
-		for _, l := range links {
-			lu, err := url.Parse(l)
-			if err != nil {
-				continue
-			}
-			if !urlutil.SameDomain(root, lu) {
-				continue
-			}
-			if _, ok := d.visited[lu.String()]; ok {
-				continue
-			}
-
-			log.Printf("[%d] following link %s", depth, lu)
-			if err := d.downloadRecursive(lu, root, depth+1); err != nil {
-				log.Printf("[%d] link fetch failed for %s: %v", depth, lu, err)
-			}
-		}
-
-	} else {
-		if _, err := storage.SaveFile(d.cfg.OutDir, relPath, bytes.NewReader(raw)); err != nil {
-			return err
-		}
-		log.Printf("[%d] saved file %s (%s)", depth, uStr, relPath)
 	}
 
 	return nil

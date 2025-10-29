@@ -31,7 +31,7 @@ func ExtractLinksAndResources(base *url.URL, body []byte) (links []string, resou
 			return
 		}
 
-		if u.Host != "" && u.Host != base.Host {
+		if !urlutil.SameDomain(base, u) {
 			return
 		}
 

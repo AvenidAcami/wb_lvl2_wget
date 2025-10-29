@@ -7,7 +7,11 @@ import (
 )
 
 func SameDomain(a, b *url.URL) bool {
-	return a != nil && b != nil && a.Hostname() == b.Hostname()
+	if a == nil || b == nil {
+		return false
+	}
+	ah, bh := a.Hostname(), b.Hostname()
+	return ah == bh || strings.HasSuffix(bh, "."+ah)
 }
 
 func ResolveURL(base *url.URL, href string) (*url.URL, error) {
@@ -28,6 +32,8 @@ func CleanPathForFile(u *url.URL, isHTML bool) string {
 		} else if !strings.Contains(path.Base(p), ".") {
 			p = path.Join(p, "index.html")
 		}
+	} else if p == "" || strings.HasSuffix(p, "/") {
+		p = path.Join(p, path.Base(u.String()))
 	}
 
 	out := path.Join(host, p)
